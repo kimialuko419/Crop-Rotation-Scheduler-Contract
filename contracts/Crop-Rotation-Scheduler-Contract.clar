@@ -10,15 +10,24 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u105))
 (define-constant ERR-ORACLE-NOT-AUTHORIZED (err u106))
 (define-constant ERR-INVALID-CROP-TYPE (err u107))
+(define-constant ERR-POOL-NOT-FOUND (err u108))
+(define-constant ERR-ALREADY-IN-POOL (err u109))
+(define-constant ERR-NOT-IN-POOL (err u110))
+(define-constant ERR-POOL-FULL (err u111))
+(define-constant ERR-INSUFFICIENT-MEMBERS (err u112))
 
 (define-constant ROTATION-CYCLE-BLOCKS u1008)
 (define-constant MIN-COMPLIANCE-PERIOD u144)
 (define-constant REWARD-MULTIPLIER u100)
 (define-constant BASE-REWARD u1000)
+(define-constant POOL-BONUS-MULTIPLIER u150)
+(define-constant MAX-POOL-MEMBERS u10)
+(define-constant MIN-POOL-MEMBERS u2)
 
 (define-data-var plot-counter uint u0)
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var contract-paused bool false)
+(define-data-var pool-counter uint u0)
 
 (define-map plots
   uint
@@ -64,6 +73,28 @@
 (define-map crop-history
   { plot-id: uint, block-height: uint }
   { crop-type: uint, verified: bool }
+)
+
+(define-map farming-pools
+  uint
+  {
+    name: (string-ascii 30),
+    creator: principal,
+    member-count: uint,
+    total-pooled-size: uint,
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map pool-members
+  { pool-id: uint, member: principal }
+  { joined-at: uint, plots-contributed: uint }
+)
+
+(define-map plot-pool-assignment
+  uint
+  { pool-id: uint }
 )
 
 (define-private (is-contract-owner)
@@ -326,4 +357,186 @@
     plot-data (ok (calculate-reward (get size plot-data) (get compliance-streak plot-data)))
     ERR-PLOT-NOT-FOUND
   )
+)
+
+(define-public (create-farming-pool (pool-name (string-ascii 30)))
+  (let (
+    (pool-id (+ (var-get pool-counter) u1))
+    (current-height stacks-block-height)
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (map-set farming-pools pool-id
+      {
+        name: pool-name,
+        creator: tx-sender,
+        member-count: u0,
+        total-pooled-size: u0,
+        created-at: current-height,
+        active: true
+      }
+    )
+    (var-set pool-counter pool-id)
+    (ok pool-id)
+  )
+)
+
+(define-public (join-pool (pool-id uint) (plot-id uint))
+  (let (
+    (pool-data (unwrap! (map-get? farming-pools pool-id) ERR-POOL-NOT-FOUND))
+    (plot-data (unwrap! (map-get? plots plot-id) ERR-PLOT-NOT-FOUND))
+    (current-height stacks-block-height)
+    (member-key { pool-id: pool-id, member: tx-sender })
+    (existing-assignment (map-get? plot-pool-assignment plot-id))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-plot-owner plot-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get active pool-data) ERR-POOL-NOT-FOUND)
+    (asserts! (is-none existing-assignment) ERR-ALREADY-IN-POOL)
+    (asserts! (< (get member-count pool-data) MAX-POOL-MEMBERS) ERR-POOL-FULL)
+    (let (
+      (existing-member (map-get? pool-members member-key))
+      (plots-contributed (if (is-some existing-member)
+        (get plots-contributed (unwrap-panic existing-member))
+        u0
+      ))
+    )
+      (map-set plot-pool-assignment plot-id { pool-id: pool-id })
+      (map-set pool-members member-key
+        {
+          joined-at: current-height,
+          plots-contributed: (+ plots-contributed u1)
+        }
+      )
+      (map-set farming-pools pool-id
+        (merge pool-data
+          {
+            member-count: (if (is-none existing-member)
+              (+ (get member-count pool-data) u1)
+              (get member-count pool-data)
+            ),
+            total-pooled-size: (+ (get total-pooled-size pool-data) (get size plot-data))
+          }
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (leave-pool (plot-id uint))
+  (let (
+    (plot-data (unwrap! (map-get? plots plot-id) ERR-PLOT-NOT-FOUND))
+    (assignment (unwrap! (map-get? plot-pool-assignment plot-id) ERR-NOT-IN-POOL))
+    (pool-id (get pool-id assignment))
+    (pool-data (unwrap! (map-get? farming-pools pool-id) ERR-POOL-NOT-FOUND))
+    (member-key { pool-id: pool-id, member: tx-sender })
+    (member-data (unwrap! (map-get? pool-members member-key) ERR-NOT-IN-POOL))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-plot-owner plot-id tx-sender) ERR-NOT-AUTHORIZED)
+    (map-delete plot-pool-assignment plot-id)
+    (let (
+      (new-plots-contributed (- (get plots-contributed member-data) u1))
+    )
+      (if (is-eq new-plots-contributed u0)
+        (begin
+          (map-delete pool-members member-key)
+          (map-set farming-pools pool-id
+            (merge pool-data
+              {
+                member-count: (- (get member-count pool-data) u1),
+                total-pooled-size: (- (get total-pooled-size pool-data) (get size plot-data))
+              }
+            )
+          )
+        )
+        (begin
+          (map-set pool-members member-key
+            (merge member-data { plots-contributed: new-plots-contributed })
+          )
+          (map-set farming-pools pool-id
+            (merge pool-data
+              { total-pooled-size: (- (get total-pooled-size pool-data) (get size plot-data)) }
+            )
+          )
+        )
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (claim-pool-rewards (plot-id uint))
+  (let (
+    (plot-data (unwrap! (map-get? plots plot-id) ERR-PLOT-NOT-FOUND))
+    (assignment (unwrap! (map-get? plot-pool-assignment plot-id) ERR-NOT-IN-POOL))
+    (pool-id (get pool-id assignment))
+    (pool-data (unwrap! (map-get? farming-pools pool-id) ERR-POOL-NOT-FOUND))
+    (current-height stacks-block-height)
+    (time-since-last (- current-height (get last-rotation plot-data)))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-plot-owner plot-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get active pool-data) ERR-POOL-NOT-FOUND)
+    (asserts! (>= (get member-count pool-data) MIN-POOL-MEMBERS) ERR-INSUFFICIENT-MEMBERS)
+    (asserts! (>= time-since-last ROTATION-CYCLE-BLOCKS) ERR-TOO-EARLY)
+    (let (
+      (history-verified (default-to false
+        (get verified (map-get? crop-history { plot-id: plot-id, block-height: (get last-rotation plot-data) }))
+      ))
+      (base-reward (if history-verified
+        (calculate-reward (get size plot-data) (+ (get compliance-streak plot-data) u1))
+        u0
+      ))
+      (pool-bonus (/ (* base-reward POOL-BONUS-MULTIPLIER) u100))
+      (total-reward (+ base-reward pool-bonus))
+    )
+      (if (> total-reward u0)
+        (begin
+          (try! (ft-transfer? rotation-reward total-reward CONTRACT-OWNER tx-sender))
+          (map-set plots plot-id
+            (merge plot-data
+              {
+                compliance-streak: (+ (get compliance-streak plot-data) u1),
+                total-rewards-earned: (+ (get total-rewards-earned plot-data) total-reward)
+              }
+            )
+          )
+          (update-farmer-stats tx-sender total-reward)
+          (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) total-reward))
+          (ok total-reward)
+        )
+        (ok u0)
+      )
+    )
+  )
+)
+
+(define-public (deactivate-pool (pool-id uint))
+  (let (
+    (pool-data (unwrap! (map-get? farming-pools pool-id) ERR-POOL-NOT-FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get creator pool-data)) ERR-NOT-AUTHORIZED)
+    (map-set farming-pools pool-id
+      (merge pool-data { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-pool-info (pool-id uint))
+  (map-get? farming-pools pool-id)
+)
+
+(define-read-only (get-pool-member-info (pool-id uint) (member principal))
+  (map-get? pool-members { pool-id: pool-id, member: member })
+)
+
+(define-read-only (get-plot-pool (plot-id uint))
+  (map-get? plot-pool-assignment plot-id)
+)
+
+(define-read-only (is-plot-in-pool (plot-id uint))
+  (is-some (map-get? plot-pool-assignment plot-id))
 )
