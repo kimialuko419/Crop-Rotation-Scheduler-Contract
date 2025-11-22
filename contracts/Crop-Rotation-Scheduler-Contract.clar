@@ -1,4 +1,4 @@
-(define-non-fungible-token farm-plot uint)
+﻿(define-non-fungible-token farm-plot uint)
 (define-fungible-token rotation-reward)
 
 (define-constant CONTRACT-OWNER tx-sender)
@@ -15,6 +15,11 @@
 (define-constant ERR-NOT-IN-POOL (err u110))
 (define-constant ERR-POOL-FULL (err u111))
 (define-constant ERR-INSUFFICIENT-MEMBERS (err u112))
+(define-constant ERR-LISTING-NOT-FOUND (err u113))
+(define-constant ERR-LISTING-INACTIVE (err u114))
+(define-constant ERR-INVALID-AMOUNT (err u115))
+(define-constant ERR-ESCROW-NOT-FOUND (err u116))
+(define-constant ERR-INVALID-BUYER (err u117))
 
 (define-constant ROTATION-CYCLE-BLOCKS u1008)
 (define-constant MIN-COMPLIANCE-PERIOD u144)
@@ -23,11 +28,13 @@
 (define-constant POOL-BONUS-MULTIPLIER u150)
 (define-constant MAX-POOL-MEMBERS u10)
 (define-constant MIN-POOL-MEMBERS u2)
+(define-constant ESCROW-TIMEOUT-BLOCKS u288)
 
 (define-data-var plot-counter uint u0)
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var pool-counter uint u0)
+(define-data-var listing-counter uint u0)
 
 (define-map plots
   uint
@@ -97,6 +104,32 @@
   { pool-id: uint }
 )
 
+(define-map crop-listings
+  uint
+  {
+    seller: principal,
+    crop-type: uint,
+    quantity: uint,
+    price-per-unit: uint,
+    plot-id: uint,
+    listed-at: uint,
+    active: bool,
+    requires-compliance: bool
+  }
+)
+
+(define-map escrow-orders
+  uint
+  {
+    listing-id: uint,
+    buyer: principal,
+    amount: uint,
+    quantity: uint,
+    created-at: uint,
+    completed: bool
+  }
+)
+
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT-OWNER)
 )
@@ -143,6 +176,13 @@
         }
       )
     )
+  )
+)
+
+(define-private (is-plot-compliant (plot-id uint))
+  (match (map-get? plots plot-id)
+    plot-data (>= (get compliance-streak plot-data) u1)
+    false
   )
 )
 
@@ -539,4 +579,142 @@
 
 (define-read-only (is-plot-in-pool (plot-id uint))
   (is-some (map-get? plot-pool-assignment plot-id))
+)
+
+(define-public (list-crop-for-sale (plot-id uint) (quantity uint) (price-per-unit uint) (requires-compliance bool))
+  (let (
+    (plot-data (unwrap! (map-get? plots plot-id) ERR-PLOT-NOT-FOUND))
+    (listing-id (+ (var-get listing-counter) u1))
+    (current-height stacks-block-height)
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-plot-owner plot-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (> quantity u0) ERR-INVALID-AMOUNT)
+    (asserts! (> price-per-unit u0) ERR-INVALID-AMOUNT)
+    (if requires-compliance
+      (asserts! (is-plot-compliant plot-id) ERR-NOT-AUTHORIZED)
+      true
+    )
+    (map-set crop-listings listing-id
+      {
+        seller: tx-sender,
+        crop-type: (get current-crop plot-data),
+        quantity: quantity,
+        price-per-unit: price-per-unit,
+        plot-id: plot-id,
+        listed-at: current-height,
+        active: true,
+        requires-compliance: requires-compliance
+      }
+    )
+    (var-set listing-counter listing-id)
+    (ok listing-id)
+  )
+)
+
+(define-public (purchase-crop (listing-id uint) (quantity uint))
+  (let (
+    (listing (unwrap! (map-get? crop-listings listing-id) ERR-LISTING-NOT-FOUND))
+    (total-cost (* (get price-per-unit listing) quantity))
+    (current-height stacks-block-height)
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (get active listing) ERR-LISTING-INACTIVE)
+    (asserts! (<= quantity (get quantity listing)) ERR-INVALID-AMOUNT)
+    (asserts! (> quantity u0) ERR-INVALID-AMOUNT)
+    (asserts! (not (is-eq tx-sender (get seller listing))) ERR-NOT-AUTHORIZED)
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    (map-set escrow-orders listing-id
+      {
+        listing-id: listing-id,
+        buyer: tx-sender,
+        amount: total-cost,
+        quantity: quantity,
+        created-at: current-height,
+        completed: false
+      }
+    )
+    (let (
+      (new-quantity (- (get quantity listing) quantity))
+    )
+      (map-set crop-listings listing-id
+        (merge listing
+          {
+            quantity: new-quantity,
+            active: (> new-quantity u0)
+          }
+        )
+      )
+    )
+    (ok listing-id)
+  )
+)
+
+(define-public (complete-order (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? crop-listings listing-id) ERR-LISTING-NOT-FOUND))
+    (escrow (unwrap! (map-get? escrow-orders listing-id) ERR-ESCROW-NOT-FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get seller listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get completed escrow)) ERR-ALREADY-EXISTS)
+    (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get seller listing))))
+    (map-set escrow-orders listing-id
+      (merge escrow { completed: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-order (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? crop-listings listing-id) ERR-LISTING-NOT-FOUND))
+    (escrow (unwrap! (map-get? escrow-orders listing-id) ERR-ESCROW-NOT-FOUND))
+    (current-height stacks-block-height)
+    (time-elapsed (- current-height (get created-at escrow)))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get buyer escrow)) ERR-INVALID-BUYER)
+    (asserts! (not (get completed escrow)) ERR-ALREADY-EXISTS)
+    (asserts! (>= time-elapsed ESCROW-TIMEOUT-BLOCKS) ERR-TOO-EARLY)
+    (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get buyer escrow))))
+    (map-set crop-listings listing-id
+      (merge listing
+        {
+          quantity: (+ (get quantity listing) (get quantity escrow)),
+          active: true
+        }
+      )
+    )
+    (map-delete escrow-orders listing-id)
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? crop-listings listing-id) ERR-LISTING-NOT-FOUND))
+  )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq tx-sender (get seller listing)) ERR-NOT-AUTHORIZED)
+    (asserts! (get active listing) ERR-LISTING-INACTIVE)
+    (map-set crop-listings listing-id
+      (merge listing { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-listing (listing-id uint))
+  (map-get? crop-listings listing-id)
+)
+
+(define-read-only (get-escrow-order (listing-id uint))
+  (map-get? escrow-orders listing-id)
+)
+
+(define-read-only (get-marketplace-stats)
+  {
+    total-listings: (var-get listing-counter)
+  }
 )
